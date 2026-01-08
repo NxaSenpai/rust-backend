@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mongodb = "2"
-tower-http = { version = "0.5", features = ["cors"] }
 argon2 = "0.5"
-rand_core = "0.6"
-chrono = { version = "0.4", features = ["clock"] }
-futures = "0.3.31"
+rand_core = { version = "0.6", features = ["std"] }
+chrono = "0.4"
+futures = "0.3"
+rand = "0.8"

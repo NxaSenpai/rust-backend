@@ -1,5 +1,3 @@
-mod connection_test;
-
 use axum::{
     extract::State,
     http::StatusCode,
@@ -16,14 +14,19 @@ use rand_core::OsRng;
 use mongodb::options::IndexOptions;
 use mongodb::IndexModel;
 use std::collections::HashMap;
-use axum::extract::{Query, Path};
+use axum::extract::{Query, Path, Multipart};
 use futures::stream::TryStreamExt;
 use mongodb::bson::oid::ObjectId;
+use std::fs;
+use std::path::Path as StdPath;
+use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 struct AppState {
     db: mongodb::Database,
 }
+
+
 
 #[tokio::main]
 async fn main() {
@@ -32,6 +35,12 @@ async fn main() {
     let state = Arc::new(AppState { db });
 
     ensure_indexes(&state.db).await.expect("index creation failed");
+
+    // Create uploads directory if it doesn't exist
+    let upload_dir = "uploads";
+    if !StdPath::new(upload_dir).exists() {
+        fs::create_dir_all(upload_dir).expect("Failed to create uploads directory");
+    }
 
     let cors = CorsLayer::new()
         .allow_origin(["http://localhost:5173".parse().unwrap()])
@@ -54,10 +63,20 @@ async fn main() {
         .route("/suppliers/:id", patch(update_supplier))
         .route("/suppliers/:id", delete(delete_supplier))
         .route("/suppliers/bulk-delete", post(bulk_delete_suppliers))
+        .route("/products", get(get_products))
+        .route("/products", post(create_product))
+        .route("/products/:id", patch(update_product))
+        .route("/products/:id", delete(delete_product))
+        .route("/products/bulk-delete", post(bulk_delete_products))
+        .route("/upload-image", post(upload_image))
+        // Add static file serving for uploaded images
+        .nest_service("/uploads", ServeDir::new("uploads"))
         .with_state(state)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("Server running on http://localhost:3000");
+    println!("Static files served from http://localhost:3000/uploads/");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -274,27 +293,61 @@ async fn get_user(
 #[derive(Deserialize)]
 struct UpdateUserRequest {
     email: String,
-    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
 }
 
 async fn update_user(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateUserRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
+    println!("UPDATE user: {}", payload.email);
+    
     let users = state.db.collection::<Document>("users");
-    match users
-        .update_one(doc! { "email": &payload.email }, doc! { "$set": { "name": &payload.name } }, None)
-        .await
-    {
+    
+    let mut update_fields = doc! {};
+    
+    if let Some(name) = payload.name {
+        if !name.trim().is_empty() {
+            update_fields.insert("name", name);
+        }
+    }
+    
+    if let Some(password) = payload.password {
+        if !password.is_empty() {
+            let salt = SaltString::generate(&mut OsRng);
+            let hashed = Argon2::default()
+                .hash_password(password.as_bytes(), &salt)
+                .unwrap()
+                .to_string();
+            update_fields.insert("password", hashed);
+        }
+    }
+    
+    if update_fields.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+            message: "No fields to update".into() 
+        }));
+    }
+    
+    let update_doc = doc! { "$set": update_fields };
+    
+    match users.update_one(doc! { "email": &payload.email }, update_doc, None).await {
         Ok(res) => {
-            if res.matched_count == 0 {
-                return (StatusCode::NOT_FOUND, Json(ApiResponse { message: "User not found".into() }));
+            if res.matched_count > 0 {
+                println!("User updated successfully");
+                (StatusCode::OK, Json(ApiResponse { message: "User updated".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "User not found".into() }))
             }
-            (StatusCode::OK, Json(ApiResponse { message: "Profile updated".into() }))
         }
         Err(e) => {
             eprintln!("update_user error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { message: "Update failed".into() }))
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Update failed: {}", e) 
+            }))
         }
     }
 }
@@ -396,6 +449,356 @@ impl Supplier {
             notes: self.notes,
             created_date: self.created_date.unwrap_or_else(|| "N/A".to_string()),
         }
+    }
+}
+
+#[derive(Serialize)]
+struct ProductResponse {
+    #[serde(rename = "_id")]
+    id: String,
+    name: String,
+    brand: String,
+    category: String,
+    supplier: String,
+    #[serde(rename = "inStock")]
+    in_stock: i32,
+    price: f64,
+    status: String,
+    #[serde(rename = "imageSrc")]
+    image_src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "stockAt")]
+    stock_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Product {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    name: String,
+    brand: String,
+    category: String,
+    supplier: String,
+    #[serde(rename = "inStock")]
+    in_stock: i32,
+    price: f64,
+    status: String,
+    #[serde(rename = "imageSrc")]
+    image_src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(rename = "stockAt", skip_serializing_if = "Option::is_none")]
+    stock_at: Option<String>,
+}
+
+impl Product {
+    fn to_response(self) -> ProductResponse {
+        ProductResponse {
+            id: self.id.map(|oid| oid.to_hex()).unwrap_or_default(),
+            name: self.name,
+            brand: self.brand,
+            category: self.category,
+            supplier: self.supplier,
+            in_stock: self.in_stock,
+            price: self.price,
+            status: self.status,
+            image_src: self.image_src,
+            description: self.description,
+            stock_at: self.stock_at.unwrap_or_else(|| chrono::Utc::now().format("%a, %b %d, %Y").to_string()),
+        }
+    }
+}
+
+async fn update_category_product_count(
+    db: &mongodb::Database,
+    category_name: &str,
+    increment: i32,
+) -> Result<(), mongodb::error::Error> {
+    let collection = db.collection::<Document>("categories");
+    collection.update_one(
+        doc! { "name": category_name },
+        doc! { "$inc": { "productCount": increment } },
+        None,
+    ).await?;
+    Ok(())
+}
+
+async fn update_supplier_product_count(
+    db: &mongodb::Database,
+    supplier_name: &str,
+    increment: i32,
+) -> Result<(), mongodb::error::Error> {
+    let collection = db.collection::<Document>("suppliers");
+    collection.update_one(
+        doc! { "companyName": supplier_name },
+        doc! { "$inc": { "productCount": increment } },
+        None,
+    ).await?;
+    Ok(())
+}
+
+async fn create_product(
+    State(state): State<Arc<AppState>>,
+    Json(mut payload): Json<Product>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Creating product: {:?}", payload);
+    let collection = state.db.collection::<Product>("products");
+    
+    payload.stock_at = Some(chrono::Utc::now().format("%a, %b %d, %Y").to_string());
+    payload.id = None;
+    
+    let category = payload.category.clone();
+    let supplier = payload.supplier.clone();
+    
+    match collection.insert_one(&payload, None).await {
+        Ok(result) => {
+            println!("Product created with ID: {:?}", result.inserted_id);
+            
+            if let Err(e) = update_category_product_count(&state.db, &category, 1).await {
+                eprintln!("Failed to update category count: {:?}", e);
+            }
+            
+            if let Err(e) = update_supplier_product_count(&state.db, &supplier, 1).await {
+                eprintln!("Failed to update supplier count: {:?}", e);
+            }
+            
+            (StatusCode::CREATED, Json(ApiResponse { message: "Product created".into() }))
+        }
+        Err(e) => {
+            eprintln!("create_product error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Failed to create product: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn update_product(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<Product>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("UPDATE /products/{}", id);
+    println!("Payload: {:?}", payload);
+    
+    let collection = state.db.collection::<Document>("products");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(oid) => {
+            println!("Parsed ObjectId successfully: {}", oid);
+            oid
+        },
+        Err(e) => {
+            eprintln!("Failed to parse ObjectId '{}': {:?}", id, e);
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+                message: format!("Invalid ID format: {}", e) 
+            }));
+        }
+    };
+
+    let old_product = match collection.find_one(doc! { "_id": oid }, None).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(ApiResponse { message: "Product not found".into() }));
+        }
+        Err(e) => {
+            eprintln!("Error fetching old product: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: "Failed to fetch product".into() 
+            }));
+        }
+    };
+
+    let old_category = old_product.get_str("category").unwrap_or("").to_string();
+    let old_supplier = old_product.get_str("supplier").unwrap_or("").to_string();
+    
+    let new_category = payload.category.clone();
+    let new_supplier = payload.supplier.clone();
+
+    let update_doc = doc! {
+        "$set": {
+            "name": payload.name,
+            "brand": payload.brand,
+            "category": &new_category,
+            "supplier": &new_supplier,
+            "inStock": payload.in_stock,
+            "price": payload.price,
+            "status": payload.status,
+            "imageSrc": payload.image_src,
+            "description": payload.description.unwrap_or_default(),
+        }
+    };
+
+    match collection.update_one(doc! { "_id": oid }, update_doc, None).await {
+        Ok(res) => {
+            println!("Update result - matched: {}, modified: {}", res.matched_count, res.modified_count);
+            
+            if res.matched_count > 0 {
+                if old_category != new_category {
+                    if let Err(e) = update_category_product_count(&state.db, &old_category, -1).await {
+                        eprintln!("Failed to decrement old category count: {:?}", e);
+                    }
+                    if let Err(e) = update_category_product_count(&state.db, &new_category, 1).await {
+                        eprintln!("Failed to increment new category count: {:?}", e);
+                    }
+                }
+                
+                if old_supplier != new_supplier {
+                    if let Err(e) = update_supplier_product_count(&state.db, &old_supplier, -1).await {
+                        eprintln!("Failed to decrement old supplier count: {:?}", e);
+                    }
+                    if let Err(e) = update_supplier_product_count(&state.db, &new_supplier, 1).await {
+                        eprintln!("Failed to increment new supplier count: {:?}", e);
+                    }
+                }
+                
+                (StatusCode::OK, Json(ApiResponse { message: "Product updated".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "Product not found".into() }))
+            }
+        }
+        Err(e) => {
+            eprintln!("update_product error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Update failed: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn delete_product(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("DELETE /products/{}", id);
+    
+    let collection = state.db.collection::<Document>("products");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(oid) => {
+            println!("Parsed ObjectId successfully: {}", oid);
+            oid
+        },
+        Err(e) => {
+            eprintln!("Failed to parse ObjectId '{}': {:?}", id, e);
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+                message: format!("Invalid ID format: {}", e) 
+            }));
+        }
+    };
+
+    let product = match collection.find_one(doc! { "_id": oid }, None).await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(ApiResponse { message: "Product not found".into() }));
+        }
+        Err(e) => {
+            eprintln!("Error fetching product: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: "Failed to fetch product".into() 
+            }));
+        }
+    };
+
+    let category = product.get_str("category").unwrap_or("").to_string();
+    let supplier = product.get_str("supplier").unwrap_or("").to_string();
+
+    match collection.delete_one(doc! { "_id": oid }, None).await {
+        Ok(res) => {
+            println!("Delete result - deleted: {}", res.deleted_count);
+            if res.deleted_count > 0 {
+                if let Err(e) = update_category_product_count(&state.db, &category, -1).await {
+                    eprintln!("Failed to decrement category count: {:?}", e);
+                }
+                if let Err(e) = update_supplier_product_count(&state.db, &supplier, -1).await {
+                    eprintln!("Failed to decrement supplier count: {:?}", e);
+                }
+                
+                (StatusCode::OK, Json(ApiResponse { message: "Product deleted".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "Product not found".into() }))
+            }
+        }
+        Err(e) => {
+            eprintln!("delete_product error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Delete failed: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn bulk_delete_products(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("BULK DELETE PRODUCTS - Received {} IDs", payload.ids.len());
+    println!("IDs: {:?}", payload.ids);
+    
+    let collection = state.db.collection::<Document>("products");
+    
+    let oids: Vec<ObjectId> = payload.ids
+        .iter()
+        .filter_map(|id| ObjectId::parse_str(id).ok())
+        .collect();
+
+    println!("Successfully parsed {} ObjectIds", oids.len());
+
+    if oids.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+            message: "No valid IDs provided".into() 
+        }));
+    }
+
+    let products_cursor = collection.find(doc! { "_id": { "$in": &oids } }, None).await;
+    
+    if let Ok(cursor) = products_cursor {
+        let products: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
+        
+        let mut category_counts: HashMap<String, i32> = HashMap::new();
+        let mut supplier_counts: HashMap<String, i32> = HashMap::new();
+        
+        for product in products {
+            if let Ok(category) = product.get_str("category") {
+                *category_counts.entry(category.to_string()).or_insert(0) += 1;
+            }
+            if let Ok(supplier) = product.get_str("supplier") {
+                *supplier_counts.entry(supplier.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        match collection.delete_many(doc! { "_id": { "$in": oids } }, None).await {
+            Ok(res) => {
+                println!("Bulk delete result - deleted: {}", res.deleted_count);
+                
+                for (category, count) in category_counts {
+                    if let Err(e) = update_category_product_count(&state.db, &category, -count).await {
+                        eprintln!("Failed to update category {} count: {:?}", category, e);
+                    }
+                }
+                
+                for (supplier, count) in supplier_counts {
+                    if let Err(e) = update_supplier_product_count(&state.db, &supplier, -count).await {
+                        eprintln!("Failed to update supplier {} count: {:?}", supplier, e);
+                    }
+                }
+                
+                (StatusCode::OK, Json(ApiResponse { 
+                    message: format!("{} products deleted", res.deleted_count) 
+                }))
+            }
+            Err(e) => {
+                eprintln!("bulk_delete_products error: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                    message: format!("Bulk delete failed: {}", e) 
+                }))
+            }
+        }
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+            message: "Failed to fetch products".into() 
+        }))
     }
 }
 
@@ -776,4 +1179,82 @@ async fn bulk_delete_suppliers(
             }))
         }
     }
+}
+
+async fn get_products(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<Vec<ProductResponse>>) {
+    println!("GET /products called");
+    let collection = state.db.collection::<Product>("products");
+    
+    match collection.find(None, None).await {
+        Ok(cursor) => {
+            let products: Vec<Product> = cursor.try_collect().await.unwrap_or_default();
+            let response: Vec<ProductResponse> = products
+                .into_iter()
+                .map(|prod| prod.to_response())
+                .collect();
+            println!("Found {} products", response.len());
+            (StatusCode::OK, Json(response))
+        }
+        Err(e) => {
+            eprintln!("get_products error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    message: String,
+    #[serde(rename = "imagePath")]
+    image_path: String,
+}
+
+async fn upload_image(
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, Json<ApiResponse>)> {
+    let upload_dir = "uploads";
+    if !StdPath::new(upload_dir).exists() {
+        fs::create_dir_all(upload_dir).map_err(|e| {
+            eprintln!("Failed to create upload directory: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to create upload directory".into()
+            }))
+        })?;
+    }
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap_or("file").to_string();
+        let filename = field.file_name().unwrap_or("unknown").to_string();
+        let data = field.bytes().await.unwrap();
+
+        if name == "image" {
+            let timestamp = chrono::Utc::now().timestamp();
+            let ext = StdPath::new(&filename)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("png");
+            let unique_filename = format!("product_{}_{}.{}", timestamp, rand::random::<u32>(), ext);
+            let filepath = format!("{}/{}", upload_dir, unique_filename);
+
+            fs::write(&filepath, &data).map_err(|e| {
+                eprintln!("Failed to save file: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                    message: "Failed to save file".into()
+                }))
+            })?;
+
+            println!("File uploaded: {}", filepath);
+
+            return Ok(Json(UploadResponse {
+                message: "Image uploaded successfully".into(),
+                image_path: format!("http://localhost:3000/uploads/{}", unique_filename),
+            }));
+        }
+    }
+
+    Err((StatusCode::BAD_REQUEST, Json(ApiResponse {
+        message: "No image file provided".into()
+    })))
 }
