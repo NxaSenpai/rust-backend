@@ -36,7 +36,6 @@ async fn main() {
 
     ensure_indexes(&state.db).await.expect("index creation failed");
 
-    // Create uploads directory if it doesn't exist
     let upload_dir = "uploads";
     if !StdPath::new(upload_dir).exists() {
         fs::create_dir_all(upload_dir).expect("Failed to create uploads directory");
@@ -53,6 +52,7 @@ async fn main() {
         .route("/login", post(login))
         .route("/user", get(get_user))
         .route("/user", patch(update_user))
+        .route("/users", get(get_users_by_role))
         .route("/categories", get(get_categories))
         .route("/categories", post(create_category))
         .route("/categories/:id", patch(update_category))
@@ -69,14 +69,12 @@ async fn main() {
         .route("/products/:id", delete(delete_product))
         .route("/products/bulk-delete", post(bulk_delete_products))
         .route("/upload-image", post(upload_image))
-        // Add static file serving for uploaded images
         .nest_service("/uploads", ServeDir::new("uploads"))
         .with_state(state)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Server running on http://localhost:3000");
-    println!("Static files served from http://localhost:3000/uploads/");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -1257,4 +1255,66 @@ async fn upload_image(
     Err((StatusCode::BAD_REQUEST, Json(ApiResponse {
         message: "No image file provided".into()
     })))
+}
+
+#[derive(Serialize)]
+struct UserListResponse {
+    #[serde(rename = "_id")]
+    id: String,
+    name: String,
+    email: String,
+    role: String,
+    #[serde(rename = "joinSince")]
+    join_since: String,
+}
+
+async fn get_users_by_role(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<Vec<UserListResponse>>) {
+    println!("GET /users called");
+    
+    let role = params.get("role").map(|s| s.as_str()).unwrap_or("user");
+    println!("Filtering by role: {}", role);
+    
+    let collection = state.db.collection::<Document>("users");
+    
+    let filter = doc! { "role": role };
+    
+    match collection.find(filter, None).await {
+        Ok(cursor) => {
+            let users: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
+            println!("Found {} users with role '{}'", users.len(), role);
+            
+            let responses: Vec<UserListResponse> = users.into_iter().map(|doc| {
+                let id = doc.get_object_id("_id")
+                    .map(|oid| oid.to_hex())
+                    .unwrap_or_default();
+                let name = doc.get_str("name").unwrap_or("Unknown").to_string();
+                let email = doc.get_str("email").unwrap_or("").to_string();
+                let role = doc.get_str("role").unwrap_or("user").to_string();
+                let join_since = doc.get_str("date").unwrap_or("N/A").to_string();
+                
+                let formatted_date = if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&join_since) {
+                    parsed.format("%Y-%m-%d").to_string()
+                } else {
+                    join_since
+                };
+                
+                UserListResponse {
+                    id,
+                    name,
+                    email,
+                    role,
+                    join_since: formatted_date,
+                }
+            }).collect();
+            
+            (StatusCode::OK, Json(responses))
+        }
+        Err(e) => {
+            eprintln!("get_users error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
 }
