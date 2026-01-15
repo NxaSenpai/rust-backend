@@ -48,29 +48,37 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/signup", post(signup))
-        .route("/login", post(login))
-        .route("/user", get(get_user))
-        .route("/user", patch(update_user))
-        .route("/users", get(get_users_by_role))
-        .route("/categories", get(get_categories))
-        .route("/categories", post(create_category))
-        .route("/categories/:id", patch(update_category))
-        .route("/categories/:id", delete(delete_category))
-        .route("/categories/bulk-delete", post(bulk_delete_categories))
-        .route("/suppliers", get(get_suppliers))
-        .route("/suppliers", post(create_supplier))
-        .route("/suppliers/:id", patch(update_supplier))
-        .route("/suppliers/:id", delete(delete_supplier))
-        .route("/suppliers/bulk-delete", post(bulk_delete_suppliers))
-        .route("/products", get(get_products))
-        .route("/products", post(create_product))
-        .route("/products/:id", patch(update_product))
-        .route("/products/:id", delete(delete_product))
-        .route("/products/bulk-delete", post(bulk_delete_products))
-        .route("/upload-image", post(upload_image))
+        .route("/signup", post(signup).with_state(state.clone()))
+        .route("/login", post(login).with_state(state.clone()))
+        .route("/user", get(get_user).with_state(state.clone()))
+        .route("/user", patch(update_user).with_state(state.clone()))
+        .route("/user/:email", delete(delete_user_by_email).with_state(state.clone()))
+        .route("/users/:id", delete(delete_user_by_id).with_state(state.clone()))
+        .route("/users/bulk", delete(bulk_delete_users).with_state(state.clone()))
+        .route("/users", get(get_users_by_role).with_state(state.clone()))
+        .route("/categories", get(get_categories).with_state(state.clone()))
+        .route("/categories", post(create_category).with_state(state.clone()))
+        .route("/categories", patch(update_category).with_state(state.clone()))
+        .route("/categories/:id", delete(delete_category).with_state(state.clone()))
+        .route("/categories/bulk", delete(bulk_delete_categories).with_state(state.clone()))
+        .route("/suppliers", get(get_suppliers).with_state(state.clone()))
+        .route("/suppliers", post(create_supplier).with_state(state.clone()))
+        .route("/suppliers", patch(update_supplier).with_state(state.clone()))
+        .route("/suppliers/:id", delete(delete_supplier).with_state(state.clone()))
+        .route("/suppliers/bulk", delete(bulk_delete_suppliers).with_state(state.clone()))
+        .route("/products", get(get_products).with_state(state.clone()))
+        .route("/products", post(create_product).with_state(state.clone()))
+        .route("/products", patch(update_product).with_state(state.clone()))
+        .route("/products/:id", delete(delete_product).with_state(state.clone()))
+        .route("/products/bulk", delete(bulk_delete_products).with_state(state.clone()))
+        .route("/promotions", get(get_promotions).with_state(state.clone()))
+        .route("/promotions", post(create_promotion).with_state(state.clone()))
+        .route("/promotions/:id", patch(update_promotion).with_state(state.clone())) // Changed this line
+        .route("/promotions/:id", delete(delete_promotion).with_state(state.clone()))
+        .route("/promotions/bulk", delete(bulk_delete_promotions).with_state(state.clone()))
+        .route("/promotions/active", get(get_active_promotions).with_state(state.clone()))
+        .route("/upload", post(upload_image))
         .nest_service("/uploads", ServeDir::new("uploads"))
-        .with_state(state)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -231,9 +239,13 @@ async fn login(
 
 #[derive(Serialize)]
 struct UserResponse {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: Option<String>,
     email: Option<String>,
     role: Option<String>,
+    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
     message: Option<String>,
 }
 
@@ -242,49 +254,49 @@ async fn get_user(
     Query(params): Query<HashMap<String, String>>,
 ) -> (StatusCode, Json<UserResponse>) {
     let email = match params.get("email") {
-        Some(e) if !e.trim().is_empty() => e.trim().to_string(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(UserResponse {
-                    name: None,
-                    email: None,
-                    role: None,
-                    message: Some("missing email query parameter".into()),
-                }),
-            )
-        }
+        Some(e) => e,
+        None => return (StatusCode::BAD_REQUEST, Json(UserResponse {
+            id: None,
+            name: None,
+            email: None,
+            role: None,
+            created_at: None,
+            message: Some("Email parameter required".into())
+        }))
     };
 
     let users = state.db.collection::<Document>("users");
     match users.find_one(doc! { "email": &email }, None).await {
         Ok(Some(doc)) => {
-            let name = doc.get_str("name").ok().map(|s| s.to_string());
-            let email = doc.get_str("email").ok().map(|s| s.to_string());
-            let role = doc.get_str("role").ok().map(|s| s.to_string()).unwrap_or_else(|| "user".to_string());
-            (StatusCode::OK, Json(UserResponse { name, email, role: Some(role), message: None }))
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(UserResponse {
-                name: None,
-                email: None,
-                role: None,
-                message: Some("User not found".into()),
-            }),
-        ),
-        Err(e) => {
-            eprintln!("db error: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(UserResponse {
-                    name: None,
-                    email: None,
-                    role: None,
-                    message: Some("server error".into()),
-                }),
-            )
-        }
+            let id = doc.get_object_id("_id")
+                .ok()
+                .map(|oid| oid.to_hex());
+            
+            (StatusCode::OK, Json(UserResponse {
+                id,
+                name: doc.get_str("name").ok().map(String::from),
+                email: doc.get_str("email").ok().map(String::from),
+                role: doc.get_str("role").ok().map(String::from),
+                created_at: doc.get_str("createdAt").ok().map(String::from),
+                message: None
+            }))
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(UserResponse {
+            id: None,
+            name: None,
+            email: None,
+            role: None,
+            created_at: None,
+            message: Some("User not found".into())
+        })),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(UserResponse {
+            id: None,
+            name: None,
+            email: None,
+            role: None,
+            created_at: None,
+            message: Some("Database error".into())
+        }))
     }
 }
 
@@ -345,6 +357,117 @@ async fn update_user(
             eprintln!("update_user error: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
                 message: format!("Update failed: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn delete_user_by_email(
+    State(state): State<Arc<AppState>>,
+    Path(email): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("DELETE /user/{}", email);
+    
+    let users = state.db.collection::<Document>("users");
+    
+    match users.delete_one(doc! { "email": &email }, None).await {
+        Ok(res) => {
+            if res.deleted_count > 0 {
+                println!("User deleted successfully");
+                (StatusCode::OK, Json(ApiResponse { message: "User deleted".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "User not found".into() }))
+            }
+        }
+        Err(e) => {
+            eprintln!("delete_user error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Delete failed: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn delete_user_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("DELETE /users/{}", id);
+    
+    let users = state.db.collection::<Document>("users");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(e) => {
+            eprintln!("Failed to parse ObjectId '{}': {:?}", id, e);
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+                message: format!("Invalid ID format: {}", e) 
+            }));
+        }
+    };
+    
+    match users.delete_one(doc! { "_id": oid }, None).await {
+        Ok(res) => {
+            if res.deleted_count > 0 {
+                println!("User deleted successfully");
+                (StatusCode::OK, Json(ApiResponse { message: "User deleted".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "User not found".into() }))
+            }
+        }
+        Err(e) => {
+            eprintln!("delete_user error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Delete failed: {}", e) 
+            }))
+        }
+    }
+}
+
+async fn bulk_delete_users(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("BULK DELETE USERS - Received {} IDs", payload.ids.len());
+    println!("IDs: {:?}", payload.ids);
+    
+    let users = state.db.collection::<Document>("users");
+    
+    let oids: Vec<ObjectId> = payload.ids
+        .iter()
+        .filter_map(|id| {
+            match ObjectId::parse_str(id) {
+                Ok(oid) => {
+                    println!("Parsed ID: {} -> {:?}", id, oid);
+                    Some(oid)
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse ID '{}': {:?}", id, e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    println!("Successfully parsed {} ObjectIds", oids.len());
+
+    if oids.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { 
+            message: "No valid IDs provided".into() 
+        }));
+    }
+
+    match users.delete_many(doc! { "_id": { "$in": oids } }, None).await {
+        Ok(res) => {
+            println!("Bulk delete result - deleted: {}", res.deleted_count);
+            (StatusCode::OK, Json(ApiResponse { 
+                message: format!("{} users deleted", res.deleted_count) 
+            }))
+        }
+        Err(e) => {
+            eprintln!("bulk_delete_users error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
+                message: format!("Bulk delete failed: {}", e) 
             }))
         }
     }
@@ -1179,6 +1302,373 @@ async fn bulk_delete_suppliers(
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Promotion {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    #[serde(rename = "productId")]
+    product_id: String,
+    #[serde(rename = "productName")]
+    product_name: String,
+    #[serde(rename = "originalPrice")]
+    original_price: f64,
+    discount: f64,
+    #[serde(rename = "discountPercentage")]
+    discount_percentage: f64,
+    #[serde(rename = "salePrice")]
+    sale_price: f64,
+    #[serde(rename = "startDate")]
+    start_date: Option<String>,  // Changed from String to Option<String>
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,    // Changed from String to Option<String>
+    status: String,
+}
+
+#[derive(Serialize)]
+struct PromotionResponse {
+    #[serde(rename = "_id")]
+    id: String,
+    #[serde(rename = "productId")]
+    product_id: String,
+    #[serde(rename = "productName")]
+    product_name: String,
+    #[serde(rename = "originalPrice")]
+    original_price: f64,
+    discount: f64,
+    #[serde(rename = "discountPercentage")]
+    discount_percentage: f64,
+    #[serde(rename = "salePrice")]
+    sale_price: f64,
+    #[serde(rename = "startDate")]
+    start_date: String,
+    #[serde(rename = "endDate")]
+    end_date: String,
+    status: String,
+}
+
+impl Promotion {
+    fn to_response(self) -> PromotionResponse {
+        PromotionResponse {
+            id: self.id.map(|oid| oid.to_hex()).unwrap_or_default(),
+            product_id: self.product_id,
+            product_name: self.product_name,
+            original_price: self.original_price,
+            discount: self.discount,
+            discount_percentage: self.discount, // Same value, different name
+            sale_price: self.sale_price,
+            start_date: self.start_date.unwrap_or_default(), // Now works because it's Option<String>
+            end_date: self.end_date.unwrap_or_default(),     // Now works because it's Option<String>
+            status: self.status,
+        }
+    }
+}
+
+async fn get_promotions(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<Vec<PromotionResponse>>) {
+    println!("GET /promotions called");
+    let collection = state.db.collection::<Promotion>("promotions");
+    
+    match collection.find(None, None).await {
+        Ok(cursor) => {
+            match cursor.try_collect::<Vec<Promotion>>().await {
+                Ok(promotions) => {
+                    let responses: Vec<PromotionResponse> = promotions
+                        .into_iter()
+                        .map(|p| p.to_response())
+                        .collect();
+                    
+                    println!("Returning {} promotions", responses.len());
+                    (StatusCode::OK, Json(responses))
+                }
+                Err(e) => {
+                    eprintln!("Error collecting promotions: {:?}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error querying promotions: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+async fn update_promotion(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdatePromotionRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("UPDATE promotion: {}", id);
+    
+    let promotions = state.db.collection::<Document>("promotions");
+    let products = state.db.collection::<Document>("products");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid promotion ID format".into()
+            }));
+        }
+    };
+    
+    // Get product details for calculating sale price
+    let product_oid = match ObjectId::parse_str(&payload.product_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid product ID format".into()
+            }));
+        }
+    };
+    
+    let product = match products.find_one(doc! { "_id": product_oid }, None).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(ApiResponse {
+                message: "Product not found".into()
+            }));
+        }
+        Err(e) => {
+            eprintln!("Database error: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to fetch product".into()
+            }));
+        }
+    };
+    
+    let product_name = product.get_str("name").unwrap_or("Unknown").to_string();
+    let original_price = product.get_f64("price").unwrap_or(0.0);
+    let sale_price = original_price - (original_price * payload.discount / 100.0);
+    
+    let update_doc = doc! {
+        "$set": {
+            "productId": &payload.product_id,
+            "productName": product_name,
+            "originalPrice": original_price,
+            "discount": payload.discount,
+            "discountPercentage": payload.discount, // Keep both for compatibility
+            "salePrice": sale_price,
+            "startDate": &payload.start_date,
+            "endDate": &payload.end_date,
+            "status": &payload.status
+        }
+    };
+    
+    match promotions.update_one(doc! { "_id": oid }, update_doc, None).await {
+        Ok(result) => {
+            if result.matched_count > 0 {
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Promotion updated successfully".into()
+                }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Promotion not found".into()
+                }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Update error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to update promotion".into()
+            }))
+        }
+    }
+}
+
+// Add this new struct for the update request
+#[derive(Deserialize, Debug)]
+struct UpdatePromotionRequest {
+    #[serde(rename = "productId")]
+    product_id: String,
+    discount: f64,
+    #[serde(rename = "startDate")]
+    start_date: String,
+    #[serde(rename = "endDate")]
+    end_date: String,
+    status: String,
+}
+
+// Update create_promotion to use a similar approach
+async fn create_promotion(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<UpdatePromotionRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Creating promotion: {:?}", payload);
+    let collection = state.db.collection::<Document>("promotions");
+    let products = state.db.collection::<Document>("products");
+
+    // Validate product exists
+    let product_oid = match ObjectId::parse_str(&payload.product_id) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid product ID".into()
+            }));
+        }
+    };
+
+    let product = match products.find_one(doc! { "_id": product_oid }, None).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(ApiResponse {
+                message: "Product not found".into()
+            }));
+        }
+        Err(e) => {
+            eprintln!("Database error: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Database error".into()
+            }));
+        }
+    };
+
+    let product_name = product.get_str("name").unwrap_or("Unknown").to_string();
+    let original_price = product.get_f64("price").unwrap_or(0.0);
+    
+    // Calculate sale price
+    let discount = payload.discount;
+    let sale_price = original_price - (original_price * discount / 100.0);
+
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    let doc = doc! {
+        "productId": &payload.product_id,
+        "productName": product_name,
+        "originalPrice": original_price,
+        "discount": discount,
+        "discountPercentage": discount, // Store both for compatibility
+        "salePrice": sale_price,
+        "startDate": &payload.start_date,
+        "endDate": &payload.end_date,
+        "status": &payload.status,
+        "createdAt": now
+    };
+
+    match collection.insert_one(doc, None).await {
+        Ok(_) => {
+            println!("Promotion created successfully");
+            (StatusCode::CREATED, Json(ApiResponse {
+                message: "Promotion created successfully".into()
+            }))
+        }
+        Err(e) => {
+            eprintln!("Failed to create promotion: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to create promotion".into()
+            }))
+        }
+    }
+}
+
+async fn delete_promotion(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("DELETE promotion: {}", id);
+    let collection = state.db.collection::<Document>("promotions");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Invalid promotion ID".into()
+        }))
+    };
+
+    match collection.delete_one(doc! { "_id": oid }, None).await {
+        Ok(result) => {
+            if result.deleted_count == 0 {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Promotion not found".into()
+                }))
+            } else {
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Promotion deleted".into()
+                }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Delete error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Delete failed".into()
+            }))
+        }
+    }
+}
+
+async fn bulk_delete_promotions(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Bulk delete promotions: {:?}", payload.ids);
+    let collection = state.db.collection::<Document>("promotions");
+    
+    let object_ids: Vec<ObjectId> = payload.ids.iter()
+        .filter_map(|id| ObjectId::parse_str(id).ok())
+        .collect();
+    
+    if object_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "No valid IDs provided".into()
+        }));
+    }
+
+    match collection.delete_many(doc! { "_id": { "$in": object_ids } }, None).await {
+        Ok(result) => (StatusCode::OK, Json(ApiResponse {
+            message: format!("Deleted {} promotions", result.deleted_count)
+        })),
+        Err(e) => {
+            eprintln!("Bulk delete error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Bulk delete failed".into()
+            }))
+        }
+    }
+}
+
+async fn get_users_by_role(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<Vec<UserResponse>>) {
+    let role = params.get("role").map(|s| s.as_str()).unwrap_or("user");
+    
+    let users = state.db.collection::<Document>("users");
+    
+    let filter = match role {
+        "all" => doc! {},
+        _ => doc! { "role": role },
+    };
+    
+    match users.find(filter, None).await {
+        Ok(cursor) => {
+            let mut user_list = Vec::new();
+            let users_vec: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
+            
+            for user_doc in users_vec {
+                let id = user_doc.get_object_id("_id")
+                    .ok()
+                    .map(|oid| oid.to_hex());
+                
+                user_list.push(UserResponse {
+                    id,
+                    name: user_doc.get_str("name").ok().map(|s| s.to_string()),
+                    email: user_doc.get_str("email").ok().map(|s| s.to_string()),
+                    role: user_doc.get_str("role").ok().map(|s| s.to_string()),
+                    created_at: user_doc.get_str("createdAt").ok().map(|s| s.to_string()),
+                    message: None,
+                });
+            }
+            
+            (StatusCode::OK, Json(user_list))
+        }
+        Err(e) => {
+            eprintln!("get_users_by_role error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
 async fn get_products(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<Vec<ProductResponse>>) {
@@ -1204,117 +1694,126 @@ async fn get_products(
 
 #[derive(Serialize)]
 struct UploadResponse {
-    message: String,
-    #[serde(rename = "imagePath")]
-    image_path: String,
+    path: String,
 }
 
 async fn upload_image(
     mut multipart: Multipart,
-) -> Result<Json<UploadResponse>, (StatusCode, Json<ApiResponse>)> {
-    let upload_dir = "uploads";
-    if !StdPath::new(upload_dir).exists() {
-        fs::create_dir_all(upload_dir).map_err(|e| {
-            eprintln!("Failed to create upload directory: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
-                message: "Failed to create upload directory".into()
-            }))
-        })?;
-    }
-
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap_or("file").to_string();
-        let filename = field.file_name().unwrap_or("unknown").to_string();
-        let data = field.bytes().await.unwrap();
-
+) -> Result<(StatusCode, Json<UploadResponse>), StatusCode> {
+    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+        let name = field.name().unwrap_or("").to_string();
+        
         if name == "image" {
+            let filename = field.file_name().unwrap_or("upload.jpg").to_string();
+            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            
             let timestamp = chrono::Utc::now().timestamp();
-            let ext = StdPath::new(&filename)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("png");
-            let unique_filename = format!("product_{}_{}.{}", timestamp, rand::random::<u32>(), ext);
-            let filepath = format!("{}/{}", upload_dir, unique_filename);
+            let ext = filename.split('.').last().unwrap_or("jpg");
+            let unique_filename = format!("{}_{}.{}", timestamp, uuid::Uuid::new_v4(), ext);
+            let filepath = format!("uploads/{}", unique_filename);
+            
+            tokio::fs::write(&filepath, data)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            
+            return Ok((
+                StatusCode::OK,
+                Json(UploadResponse {
+                    path: unique_filename,
+                }),
+            ));
+        }
+    }
+    
+    Err(StatusCode::BAD_REQUEST)
+}
 
-            fs::write(&filepath, &data).map_err(|e| {
-                eprintln!("Failed to save file: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
-                    message: "Failed to save file".into()
-                }))
-            })?;
+async fn get_active_promotions(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<Vec<PromotionWithProduct>>) {
+    let promotions = state.db.collection::<Document>("promotions");
+    let products = state.db.collection::<Document>("products");
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    let cursor = promotions
+        .find(
+            doc! {
+                "status": "Active",
+                "endDate": { "$gte": now }
+            },
+            None,
+        )
+        .await;
 
-            println!("File uploaded: {}", filepath);
+    let Ok(mut cursor) = cursor else {
+        eprintln!("Failed to query promotions");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]));
+    };
 
-            return Ok(Json(UploadResponse {
-                message: "Image uploaded successfully".into(),
-                image_path: format!("http://localhost:3000/uploads/{}", unique_filename),
-            }));
+    let mut result = Vec::new();
+
+    while let Ok(Some(doc)) = cursor.try_next().await {
+        // Get promotion data
+        let promo_id = doc.get_object_id("_id").ok().map(|id| id.to_hex());
+        let product_id = doc.get_str("productId").ok();
+        let discount = doc.get_f64("discountPercentage").unwrap_or(
+            doc.get_f64("discount").unwrap_or(0.0)
+        );
+        let start_date = doc.get_str("startDate").ok().map(String::from);
+        let end_date = doc.get_str("endDate").ok().map(String::from);
+        
+        if let Some(pid) = product_id {
+            // Parse ObjectId safely
+            let oid = match ObjectId::parse_str(pid) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("Failed to parse product ID '{}': {:?}", pid, e);
+                    continue;
+                }
+            };
+            
+            // Find the product
+            match products.find_one(doc! { "_id": oid }, None).await {
+                Ok(Some(product_doc)) => {
+                    let original_price = product_doc.get_f64("price").unwrap_or(0.0);
+                    let sale_price = original_price - (original_price * discount / 100.0);
+                    
+                    result.push(PromotionWithProduct {
+                        id: promo_id.unwrap_or_default(),
+                        product_id: pid.to_string(),
+                        product_name: product_doc.get_str("name").unwrap_or("Unknown Product").to_string(),
+                        product_image: product_doc.get_str("imageSrc").unwrap_or("/placeholder.png").to_string(),
+                        original_price,
+                        discount,
+                        sale_price,
+                        start_date: start_date.unwrap_or_default(),
+                        end_date: end_date.unwrap_or_default(),
+                    });
+                }
+                Ok(None) => {
+                    eprintln!("Product not found for ID: {}", pid);
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch product {}: {:?}", pid, e);
+                }
+            }
         }
     }
 
-    Err((StatusCode::BAD_REQUEST, Json(ApiResponse {
-        message: "No image file provided".into()
-    })))
+    println!("Found {} active promotions", result.len());
+    (StatusCode::OK, Json(result))
 }
 
 #[derive(Serialize)]
-struct UserListResponse {
-    #[serde(rename = "_id")]
+struct PromotionWithProduct {
     id: String,
-    name: String,
-    email: String,
-    role: String,
-    #[serde(rename = "joinSince")]
-    join_since: String,
-}
-
-async fn get_users_by_role(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> (StatusCode, Json<Vec<UserListResponse>>) {
-    println!("GET /users called");
-    
-    let role = params.get("role").map(|s| s.as_str()).unwrap_or("user");
-    println!("Filtering by role: {}", role);
-    
-    let collection = state.db.collection::<Document>("users");
-    
-    let filter = doc! { "role": role };
-    
-    match collection.find(filter, None).await {
-        Ok(cursor) => {
-            let users: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
-            println!("Found {} users with role '{}'", users.len(), role);
-            
-            let responses: Vec<UserListResponse> = users.into_iter().map(|doc| {
-                let id = doc.get_object_id("_id")
-                    .map(|oid| oid.to_hex())
-                    .unwrap_or_default();
-                let name = doc.get_str("name").unwrap_or("Unknown").to_string();
-                let email = doc.get_str("email").unwrap_or("").to_string();
-                let role = doc.get_str("role").unwrap_or("user").to_string();
-                let join_since = doc.get_str("date").unwrap_or("N/A").to_string();
-                
-                let formatted_date = if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&join_since) {
-                    parsed.format("%Y-%m-%d").to_string()
-                } else {
-                    join_since
-                };
-                
-                UserListResponse {
-                    id,
-                    name,
-                    email,
-                    role,
-                    join_since: formatted_date,
-                }
-            }).collect();
-            
-            (StatusCode::OK, Json(responses))
-        }
-        Err(e) => {
-            eprintln!("get_users error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
-        }
-    }
+    product_id: String,
+    product_name: String,
+    product_image: String,
+    original_price: f64,
+    discount: f64,
+    sale_price: f64,
+    start_date: String,
+    end_date: String,
 }
