@@ -36,53 +36,69 @@ async fn main() {
 
     ensure_indexes(&state.db).await.expect("index creation failed");
 
+    // Create uploads directory if it doesn't exist
     let upload_dir = "uploads";
     if !StdPath::new(upload_dir).exists() {
-        fs::create_dir_all(upload_dir).expect("Failed to create uploads directory");
+        println!("Creating uploads directory...");
+        if let Err(e) = fs::create_dir_all(upload_dir) {
+            eprintln!("Failed to create uploads directory: {:?}", e);
+        } else {
+            println!("Uploads directory created successfully");
+        }
+    } else {
+        println!("Uploads directory already exists");
     }
 
     let cors = CorsLayer::new()
-        .allow_origin(["http://localhost:5173".parse().unwrap()])
+        .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/signup", post(signup).with_state(state.clone()))
-        .route("/login", post(login).with_state(state.clone()))
-        .route("/user", get(get_user).with_state(state.clone()))
-        .route("/user", patch(update_user).with_state(state.clone()))
-        .route("/user/:email", delete(delete_user_by_email).with_state(state.clone()))
-        .route("/users/:id", delete(delete_user_by_id).with_state(state.clone()))
-        .route("/users/bulk", delete(bulk_delete_users).with_state(state.clone()))
-        .route("/users", get(get_users_by_role).with_state(state.clone()))
-        .route("/categories", get(get_categories).with_state(state.clone()))
-        .route("/categories", post(create_category).with_state(state.clone()))
-        .route("/categories", patch(update_category).with_state(state.clone()))
-        .route("/categories/:id", delete(delete_category).with_state(state.clone()))
-        .route("/categories/bulk", delete(bulk_delete_categories).with_state(state.clone()))
-        .route("/suppliers", get(get_suppliers).with_state(state.clone()))
-        .route("/suppliers", post(create_supplier).with_state(state.clone()))
-        .route("/suppliers", patch(update_supplier).with_state(state.clone()))
-        .route("/suppliers/:id", delete(delete_supplier).with_state(state.clone()))
-        .route("/suppliers/bulk", delete(bulk_delete_suppliers).with_state(state.clone()))
-        .route("/products", get(get_products).with_state(state.clone()))
-        .route("/products", post(create_product).with_state(state.clone()))
-        .route("/products", patch(update_product).with_state(state.clone()))
-        .route("/products/:id", delete(delete_product).with_state(state.clone()))
-        .route("/products/bulk", delete(bulk_delete_products).with_state(state.clone()))
-        .route("/promotions", get(get_promotions).with_state(state.clone()))
-        .route("/promotions", post(create_promotion).with_state(state.clone()))
-        .route("/promotions/:id", patch(update_promotion).with_state(state.clone())) // Changed this line
-        .route("/promotions/:id", delete(delete_promotion).with_state(state.clone()))
-        .route("/promotions/bulk", delete(bulk_delete_promotions).with_state(state.clone()))
-        .route("/promotions/active", get(get_active_promotions).with_state(state.clone()))
+        .route("/signup", post(signup))
+        .route("/login", post(login))
+        .route("/user", get(get_user))
+        .route("/user", patch(update_user))
+        .route("/user/:email", delete(delete_user_by_email))
+        .route("/users/:id", delete(delete_user_by_id))
+        .route("/users/bulk-delete", post(bulk_delete_users))
+        .route("/users", get(get_users_by_role))
+        .route("/products", get(get_products))
+        .route("/products", post(create_product))
+        .route("/products", patch(update_product))
+        .route("/products/:id", delete(delete_product))
+        .route("/products/bulk-delete", post(bulk_delete_products))
+        .route("/categories", get(get_categories))
+        .route("/categories", post(create_category))
+        .route("/categories", patch(update_category))
+        .route("/categories/:id", delete(delete_category))
+        .route("/categories/bulk-delete", post(bulk_delete_categories))
+        .route("/suppliers", get(get_suppliers))
+        .route("/suppliers", post(create_supplier))
+        .route("/suppliers", patch(update_supplier))
+        .route("/suppliers/:id", delete(delete_supplier))
+        .route("/suppliers/bulk-delete", post(bulk_delete_suppliers))
+        .route("/promotions", get(get_promotions))
+        .route("/promotions", post(create_promotion))
+        .route("/promotions", patch(update_promotion))
+        .route("/promotions/:id", delete(delete_promotion))
+        .route("/promotions/bulk-delete", post(bulk_delete_promotions))
+        .route("/promotions/active", get(get_active_promotions))
+        .route("/coupons", get(get_coupons))
+        .route("/coupons", post(create_coupon))
+        .route("/coupons", patch(update_coupon))
+        .route("/coupons/:id", delete(delete_coupon))
+        .route("/coupons/bulk-delete", post(bulk_delete_coupons))
         .route("/upload", post(upload_image))
+        // IMPORTANT: This must come LAST to serve static files
         .nest_service("/uploads", ServeDir::new("uploads"))
-        .layer(cors);
+        .layer(cors)
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Server running on http://localhost:3000");
+    println!("Uploads will be served from http://localhost:3000/uploads/");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -664,32 +680,57 @@ async fn create_product(
     Json(mut payload): Json<Product>,
 ) -> (StatusCode, Json<ApiResponse>) {
     println!("Creating product: {:?}", payload);
-    let collection = state.db.collection::<Product>("products");
     
-    payload.stock_at = Some(chrono::Utc::now().format("%a, %b %d, %Y").to_string());
-    payload.id = None;
+    let collection = state.db.collection::<Document>("products");
     
-    let category = payload.category.clone();
-    let supplier = payload.supplier.clone();
+    // Validate required fields
+    if payload.name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Product name is required".into()
+        }));
+    }
     
-    match collection.insert_one(&payload, None).await {
-        Ok(result) => {
-            println!("Product created with ID: {:?}", result.inserted_id);
+    if payload.price <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Price must be greater than 0".into()
+        }));
+    }
+    
+    // Set default image if not provided
+    if payload.image_src.is_empty() {
+        payload.image_src = "/placeholder.png".to_string();
+    }
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    let doc = doc! {
+        "name": &payload.name,
+        "brand": &payload.brand,
+        "category": &payload.category,
+        "supplier": &payload.supplier,
+        "inStock": payload.in_stock,
+        "price": payload.price,
+        "status": &payload.status,
+        "imageSrc": &payload.image_src,
+        "description": payload.description.as_ref().unwrap_or(&String::new()),
+        "stockAt": now
+    };
+    
+    match collection.insert_one(doc, None).await {
+        Ok(_) => {
+            println!("Product created successfully");
             
-            if let Err(e) = update_category_product_count(&state.db, &category, 1).await {
-                eprintln!("Failed to update category count: {:?}", e);
-            }
+            let _ = update_category_product_count(&state.db, &payload.category, 1).await;
+            let _ = update_supplier_product_count(&state.db, &payload.supplier, 1).await;
             
-            if let Err(e) = update_supplier_product_count(&state.db, &supplier, 1).await {
-                eprintln!("Failed to update supplier count: {:?}", e);
-            }
-            
-            (StatusCode::CREATED, Json(ApiResponse { message: "Product created".into() }))
+            (StatusCode::CREATED, Json(ApiResponse {
+                message: "Product created successfully".into()
+            }))
         }
         Err(e) => {
-            eprintln!("create_product error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { 
-                message: format!("Failed to create product: {}", e) 
+            eprintln!("Failed to create product: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to create product".into()
             }))
         }
     }
@@ -1318,9 +1359,9 @@ struct Promotion {
     #[serde(rename = "salePrice")]
     sale_price: f64,
     #[serde(rename = "startDate")]
-    start_date: Option<String>,  // Changed from String to Option<String>
+    start_date: Option<String>,
     #[serde(rename = "endDate")]
-    end_date: Option<String>,    // Changed from String to Option<String>
+    end_date: Option<String>,
     status: String,
 }
 
@@ -1354,10 +1395,10 @@ impl Promotion {
             product_name: self.product_name,
             original_price: self.original_price,
             discount: self.discount,
-            discount_percentage: self.discount, // Same value, different name
+            discount_percentage: self.discount,
             sale_price: self.sale_price,
-            start_date: self.start_date.unwrap_or_default(), // Now works because it's Option<String>
-            end_date: self.end_date.unwrap_or_default(),     // Now works because it's Option<String>
+            start_date: self.start_date.unwrap_or_default(),
+            end_date: self.end_date.unwrap_or_default(),
             status: self.status,
         }
     }
@@ -1413,7 +1454,6 @@ async fn update_promotion(
         }
     };
     
-    // Get product details for calculating sale price
     let product_oid = match ObjectId::parse_str(&payload.product_id) {
         Ok(id) => id,
         Err(_) => {
@@ -1448,7 +1488,7 @@ async fn update_promotion(
             "productName": product_name,
             "originalPrice": original_price,
             "discount": payload.discount,
-            "discountPercentage": payload.discount, // Keep both for compatibility
+            "discountPercentage": payload.discount,
             "salePrice": sale_price,
             "startDate": &payload.start_date,
             "endDate": &payload.end_date,
@@ -1477,7 +1517,6 @@ async fn update_promotion(
     }
 }
 
-// Add this new struct for the update request
 #[derive(Deserialize, Debug)]
 struct UpdatePromotionRequest {
     #[serde(rename = "productId")]
@@ -1490,7 +1529,6 @@ struct UpdatePromotionRequest {
     status: String,
 }
 
-// Update create_promotion to use a similar approach
 async fn create_promotion(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdatePromotionRequest>,
@@ -1499,7 +1537,6 @@ async fn create_promotion(
     let collection = state.db.collection::<Document>("promotions");
     let products = state.db.collection::<Document>("products");
 
-    // Validate product exists
     let product_oid = match ObjectId::parse_str(&payload.product_id) {
         Ok(oid) => oid,
         Err(_) => {
@@ -1527,7 +1564,6 @@ async fn create_promotion(
     let product_name = product.get_str("name").unwrap_or("Unknown").to_string();
     let original_price = product.get_f64("price").unwrap_or(0.0);
     
-    // Calculate sale price
     let discount = payload.discount;
     let sale_price = original_price - (original_price * discount / 100.0);
 
@@ -1538,7 +1574,7 @@ async fn create_promotion(
         "productName": product_name,
         "originalPrice": original_price,
         "discount": discount,
-        "discountPercentage": discount, // Store both for compatibility
+        "discountPercentage": discount,
         "salePrice": sale_price,
         "startDate": &payload.start_date,
         "endDate": &payload.end_date,
@@ -1694,37 +1730,105 @@ async fn get_products(
 
 #[derive(Serialize)]
 struct UploadResponse {
-    path: String,
+    url: String,
+    filename: String,
 }
 
 async fn upload_image(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<UploadResponse>), StatusCode> {
-    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
-        let name = field.name().unwrap_or("").to_string();
-        
-        if name == "image" {
-            let filename = field.file_name().unwrap_or("upload.jpg").to_string();
-            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-            
-            let timestamp = chrono::Utc::now().timestamp();
-            let ext = filename.split('.').last().unwrap_or("jpg");
-            let unique_filename = format!("{}_{}.{}", timestamp, uuid::Uuid::new_v4(), ext);
-            let filepath = format!("uploads/{}", unique_filename);
-            
-            tokio::fs::write(&filepath, data)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            
-            return Ok((
-                StatusCode::OK,
-                Json(UploadResponse {
-                    path: unique_filename,
-                }),
-            ));
-        }
+    println!("=== Upload image endpoint called ===");
+    
+    let upload_dir = "uploads";
+    
+    // Ensure upload directory exists
+    if let Err(e) = fs::create_dir_all(upload_dir) {
+        eprintln!("Failed to create upload directory: {:?}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     
+    // Process multipart form
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        println!("Field name: {}", name);
+        
+        // Skip if not an image field
+        if name != "image" {
+            println!("Skipping non-image field");
+            continue;
+        }
+        
+        // Get filename
+        let filename = match field.file_name() {
+            Some(f) => f.to_string(),
+            None => {
+                eprintln!("No filename provided");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+        
+        println!("Received file: {}", filename);
+        
+        // Validate file type
+        let ext = StdPath::new(&filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+        
+        if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+            eprintln!("Invalid file type: {}", ext);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        
+        // Get file data
+        let data = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("Failed to read file data: {:?}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        
+        println!("File size: {} bytes", data.len());
+        
+        // Validate file size (max 10MB)
+        if data.len() > 10 * 1024 * 1024 {
+            eprintln!("File too large: {} bytes", data.len());
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        
+        // Generate unique filename with timestamp
+        let timestamp = chrono::Utc::now().timestamp();
+        let uuid = uuid::Uuid::new_v4();
+        let new_filename = format!("{}_{}.{}", timestamp, uuid, ext);
+        let filepath = format!("{}/{}", upload_dir, new_filename);
+        
+        println!("Saving to: {}", filepath);
+        
+        // Write file
+        if let Err(e) = fs::write(&filepath, &data) {
+            eprintln!("Failed to save file: {:?}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        
+        println!("File saved successfully: {}", filepath);
+        
+        // Return the URL path that matches the ServeDir route
+        let url = format!("/uploads/{}", new_filename);
+        
+        println!("Returning URL: {}", url);
+        
+        return Ok((
+            StatusCode::OK,
+            Json(UploadResponse {
+                url,
+                filename: new_filename,
+            })
+        ));
+    }
+    
+    eprintln!("No image field found in request");
     Err(StatusCode::BAD_REQUEST)
 }
 
@@ -1754,7 +1858,6 @@ async fn get_active_promotions(
     let mut result = Vec::new();
 
     while let Ok(Some(doc)) = cursor.try_next().await {
-        // Get promotion data
         let promo_id = doc.get_object_id("_id").ok().map(|id| id.to_hex());
         let product_id = doc.get_str("productId").ok();
         let discount = doc.get_f64("discountPercentage").unwrap_or(
@@ -1764,7 +1867,6 @@ async fn get_active_promotions(
         let end_date = doc.get_str("endDate").ok().map(String::from);
         
         if let Some(pid) = product_id {
-            // Parse ObjectId safely
             let oid = match ObjectId::parse_str(pid) {
                 Ok(id) => id,
                 Err(e) => {
@@ -1773,7 +1875,6 @@ async fn get_active_promotions(
                 }
             };
             
-            // Find the product
             match products.find_one(doc! { "_id": oid }, None).await {
                 Ok(Some(product_doc)) => {
                     let original_price = product_doc.get_f64("price").unwrap_or(0.0);
@@ -1816,4 +1917,369 @@ struct PromotionWithProduct {
     sale_price: f64,
     start_date: String,
     end_date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Coupon {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    code: String,
+    #[serde(rename = "type")]
+    coupon_type: String,
+    value: f64,
+    #[serde(rename = "expiryDate")]
+    expiry_date: String,
+    #[serde(rename = "maxUses", skip_serializing_if = "Option::is_none")]
+    max_uses: Option<i32>,
+    #[serde(rename = "currentUses")]
+    current_uses: i32,
+    #[serde(rename = "minPurchase", skip_serializing_if = "Option::is_none")]
+    min_purchase: Option<f64>,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct CouponResponse {
+    #[serde(rename = "_id")]
+    id: String,
+    code: String,
+    #[serde(rename = "type")]
+    coupon_type: String,
+    value: f64,
+    #[serde(rename = "expiryDate")]
+    expiry_date: String,
+    #[serde(rename = "maxUses", skip_serializing_if = "Option::is_none")]
+    max_uses: Option<i32>,
+    #[serde(rename = "currentUses")]
+    current_uses: i32,
+    #[serde(rename = "minPurchase", skip_serializing_if = "Option::is_none")]
+    min_purchase: Option<f64>,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+impl Coupon {
+    fn to_response(self) -> CouponResponse {
+        CouponResponse {
+            id: self.id.map(|oid| oid.to_hex()).unwrap_or_default(),
+            code: self.code,
+            coupon_type: self.coupon_type,
+            value: self.value,
+            expiry_date: self.expiry_date,
+            max_uses: self.max_uses,
+            current_uses: self.current_uses,
+            min_purchase: self.min_purchase,
+            active: self.active,
+            notes: self.notes,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct CreateCouponRequest {
+    code: String,
+    #[serde(rename = "type")]
+    coupon_type: String,
+    value: f64,
+    #[serde(rename = "expiryDate")]
+    expiry_date: String,
+    #[serde(rename = "maxUses")]
+    max_uses: Option<i32>,
+    #[serde(rename = "minPurchase")]
+    min_purchase: Option<f64>,
+    active: bool,
+    notes: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UpdateCouponRequest {
+    #[serde(rename = "_id")]
+    id: String,
+    code: String,
+    #[serde(rename = "type")]
+    coupon_type: String,
+    value: f64,
+    #[serde(rename = "expiryDate")]
+    expiry_date: String,
+    #[serde(rename = "maxUses")]
+    max_uses: Option<i32>,
+    #[serde(rename = "minPurchase")]
+    min_purchase: Option<f64>,
+    active: bool,
+    notes: Option<String>,
+}
+
+async fn get_coupons(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<Vec<CouponResponse>>) {
+    println!("GET /coupons called");
+    let collection = state.db.collection::<Coupon>("coupons");
+    
+    match collection.find(None, None).await {
+        Ok(cursor) => {
+            match cursor.try_collect::<Vec<Coupon>>().await {
+                Ok(coupons) => {
+                    let responses: Vec<CouponResponse> = coupons
+                        .into_iter()
+                        .map(|c| c.to_response())
+                        .collect();
+                    
+                    println!("Returning {} coupons", responses.len());
+                    (StatusCode::OK, Json(responses))
+                }
+                Err(e) => {
+                    eprintln!("Error collecting coupons: {:?}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error querying coupons: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+async fn create_coupon(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateCouponRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Creating coupon: {:?}", payload);
+    
+    if payload.code.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Coupon code cannot be empty".into()
+        }));
+    }
+    
+    if payload.value <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Coupon value must be greater than 0".into()
+        }));
+    }
+    
+    if payload.coupon_type == "percentage" && payload.value > 100.0 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Percentage discount cannot exceed 100%".into()
+        }));
+    }
+    
+    let collection = state.db.collection::<Document>("coupons");
+    
+    let code_upper = payload.code.to_uppercase();
+    match collection.find_one(doc! { "code": &code_upper }, None).await {
+        Ok(Some(_)) => {
+            return (StatusCode::CONFLICT, Json(ApiResponse {
+                message: "Coupon code already exists".into()
+            }));
+        }
+        Ok(None) => {},
+        Err(e) => {
+            eprintln!("Database error checking coupon: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Database error".into()
+            }));
+        }
+    }
+    
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    let doc = doc! {
+        "code": code_upper,
+        "type": payload.coupon_type,
+        "value": payload.value,
+        "expiryDate": payload.expiry_date,
+        "maxUses": payload.max_uses,
+        "currentUses": 0,
+        "minPurchase": payload.min_purchase,
+        "active": payload.active,
+        "notes": payload.notes,
+        "createdAt": now
+    };
+    
+    match collection.insert_one(doc, None).await {
+        Ok(_) => {
+            println!("Coupon created successfully");
+            (StatusCode::CREATED, Json(ApiResponse {
+                message: "Coupon created successfully".into()
+            }))
+        }
+        Err(e) => {
+            eprintln!("Failed to create coupon: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to create coupon".into()
+            }))
+        }
+    }
+}
+
+async fn update_coupon(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<UpdateCouponRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Updating coupon: {:?}", payload);
+    
+    if payload.code.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Coupon code cannot be empty".into()
+        }));
+    }
+    
+    if payload.value <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Coupon value must be greater than 0".into()
+        }));
+    }
+    
+    if payload.coupon_type == "percentage" && payload.value > 100.0 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Percentage discount cannot exceed 100%".into()
+        }));
+    }
+    
+    let collection = state.db.collection::<Document>("coupons");
+    
+    let oid = match ObjectId::parse_str(&payload.id) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid coupon ID".into()
+            }));
+        }
+    };
+    
+    let code_upper = payload.code.to_uppercase();
+    match collection.find_one(doc! { 
+        "code": &code_upper,
+        "_id": { "$ne": &oid }
+    }, None).await {
+        Ok(Some(_)) => {
+            return (StatusCode::CONFLICT, Json(ApiResponse {
+                message: "Coupon code already exists".into()
+            }));
+        }
+        Ok(None) => {},
+        Err(e) => {
+            eprintln!("Database error: {:?}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Database error".into()
+            }));
+        }
+    }
+    
+    let update_doc = doc! {
+        "$set": {
+            "code": code_upper,
+            "type": payload.coupon_type,
+            "value": payload.value,
+            "expiryDate": payload.expiry_date,
+            "maxUses": payload.max_uses,
+            "minPurchase": payload.min_purchase,
+            "active": payload.active,
+            "notes": payload.notes,
+        }
+    };
+    
+    println!("Update document: {:?}", update_doc);
+    
+    match collection.update_one(doc! { "_id": oid }, update_doc, None).await {
+        Ok(result) => {
+            if result.matched_count > 0 {
+                println!("Coupon updated successfully");
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Coupon updated successfully".into()
+                }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Coupon not found".into()
+                }))
+
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to update coupon: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to update coupon".into()
+            }))
+        }
+    }
+}
+
+async fn delete_coupon(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("DELETE /coupons/{}", id);
+    let collection = state.db.collection::<Document>("coupons");
+    
+    let oid = match ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid coupon ID".into()
+            }));
+        }
+    };
+    
+    match collection.delete_one(doc! { "_id": oid }, None).await {
+        Ok(result) => {
+            if result.deleted_count > 0 {
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Coupon deleted successfully".into()
+                }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Coupon not found".into()
+                }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to delete coupon: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to delete coupon".into()
+            }))
+        }
+    }
+}
+
+async fn bulk_delete_coupons(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("BULK DELETE COUPONS - Received {} IDs", payload.ids.len());
+    
+    let collection = state.db.collection::<Document>("coupons");
+    
+    let oids: Vec<ObjectId> = payload.ids
+        .iter()
+        .filter_map(|id| ObjectId::parse_str(id).ok())
+        .collect();
+    
+    if oids.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "No valid IDs provided".into()
+        }));
+    }
+    
+    match collection.delete_many(doc! { "_id": { "$in": oids } }, None).await {
+        Ok(result) => {
+            (StatusCode::OK, Json(ApiResponse {
+                message: format!("Deleted {} coupons", result.deleted_count)
+            }))
+        }
+        Err(e) => {
+            eprintln!("Failed to bulk delete: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to delete coupons".into()
+            }))
+        }
+    }
 }
