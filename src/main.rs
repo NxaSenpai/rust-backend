@@ -36,7 +36,6 @@ async fn main() {
 
     ensure_indexes(&state.db).await.expect("index creation failed");
 
-    // Create uploads directory if it doesn't exist
     let upload_dir = "uploads";
     if !StdPath::new(upload_dir).exists() {
         println!("Creating uploads directory...");
@@ -66,32 +65,31 @@ async fn main() {
         .route("/users", get(get_users_by_role))
         .route("/products", get(get_products))
         .route("/products", post(create_product))
-        .route("/products", patch(update_product))
+        .route("/products/:id", patch(update_product))
         .route("/products/:id", delete(delete_product))
         .route("/products/bulk-delete", post(bulk_delete_products))
         .route("/categories", get(get_categories))
         .route("/categories", post(create_category))
-        .route("/categories", patch(update_category))
+        .route("/categories/:id", patch(update_category))
         .route("/categories/:id", delete(delete_category))
         .route("/categories/bulk-delete", post(bulk_delete_categories))
         .route("/suppliers", get(get_suppliers))
         .route("/suppliers", post(create_supplier))
-        .route("/suppliers", patch(update_supplier))
+        .route("/suppliers/:id", patch(update_supplier))
         .route("/suppliers/:id", delete(delete_supplier))
         .route("/suppliers/bulk-delete", post(bulk_delete_suppliers))
         .route("/promotions", get(get_promotions))
         .route("/promotions", post(create_promotion))
-        .route("/promotions", patch(update_promotion))
+        .route("/promotions/:id", patch(update_promotion))
         .route("/promotions/:id", delete(delete_promotion))
         .route("/promotions/bulk-delete", post(bulk_delete_promotions))
         .route("/promotions/active", get(get_active_promotions))
         .route("/coupons", get(get_coupons))
         .route("/coupons", post(create_coupon))
-        .route("/coupons", patch(update_coupon))
+        .route("/coupons/:id", patch(update_coupon))
         .route("/coupons/:id", delete(delete_coupon))
         .route("/coupons/bulk-delete", post(bulk_delete_coupons))
         .route("/upload", post(upload_image))
-        // IMPORTANT: This must come LAST to serve static files
         .nest_service("/uploads", ServeDir::new("uploads"))
         .layer(cors)
         .with_state(state);
