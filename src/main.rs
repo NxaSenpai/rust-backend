@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use core::str;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use mongodb::{Client, bson::{doc, Document}};
@@ -64,6 +65,7 @@ async fn main() {
         .route("/users/bulk-delete", post(bulk_delete_users))
         .route("/users", get(get_users_by_role))
         .route("/products", get(get_products))
+        .route("/products/:id", get(get_product_by_id))
         .route("/products", post(create_product))
         .route("/products/:id", patch(update_product))
         .route("/products/:id", delete(delete_product))
@@ -88,8 +90,17 @@ async fn main() {
         .route("/coupons", post(create_coupon))
         .route("/coupons/:id", patch(update_coupon))
         .route("/coupons/:id", delete(delete_coupon))
+        .route("/coupons/validate", get(validate_coupon))
         .route("/coupons/bulk-delete", post(bulk_delete_coupons))
         .route("/upload", post(upload_image))
+        .route("/wishlist", post(add_to_wishlist))
+        .route("/wishlist", get(get_wishlist))
+        .route("/orders", post(create_order))
+        .route("/orders", get(get_orders))
+        .route("/orders/all", get(get_all_orders))
+        .route("/orders/:id/status", patch(update_order_status))
+        .route("/orders/:id", delete(delete_order))
+        .route("/wishlist/remove", post(remove_from_wishlist))
         .nest_service("/uploads", ServeDir::new("uploads"))
         .layer(cors)
         .with_state(state);
@@ -681,7 +692,6 @@ async fn create_product(
     
     let collection = state.db.collection::<Document>("products");
     
-    // Validate required fields
     if payload.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(ApiResponse {
             message: "Product name is required".into()
@@ -694,7 +704,6 @@ async fn create_product(
         }));
     }
     
-    // Set default image if not provided
     if payload.image_src.is_empty() {
         payload.image_src = "/placeholder.png".to_string();
     }
@@ -1739,24 +1748,20 @@ async fn upload_image(
     
     let upload_dir = "uploads";
     
-    // Ensure upload directory exists
     if let Err(e) = fs::create_dir_all(upload_dir) {
         eprintln!("Failed to create upload directory: {:?}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     
-    // Process multipart form
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         println!("Field name: {}", name);
         
-        // Skip if not an image field
         if name != "image" {
             println!("Skipping non-image field");
             continue;
         }
         
-        // Get filename
         let filename = match field.file_name() {
             Some(f) => f.to_string(),
             None => {
@@ -1767,7 +1772,6 @@ async fn upload_image(
         
         println!("Received file: {}", filename);
         
-        // Validate file type
         let ext = StdPath::new(&filename)
             .extension()
             .and_then(|e| e.to_str())
@@ -1779,7 +1783,6 @@ async fn upload_image(
             return Err(StatusCode::BAD_REQUEST);
         }
         
-        // Get file data
         let data = match field.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1790,13 +1793,11 @@ async fn upload_image(
         
         println!("File size: {} bytes", data.len());
         
-        // Validate file size (max 10MB)
         if data.len() > 10 * 1024 * 1024 {
             eprintln!("File too large: {} bytes", data.len());
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
         
-        // Generate unique filename with timestamp
         let timestamp = chrono::Utc::now().timestamp();
         let uuid = uuid::Uuid::new_v4();
         let new_filename = format!("{}_{}.{}", timestamp, uuid, ext);
@@ -1804,7 +1805,6 @@ async fn upload_image(
         
         println!("Saving to: {}", filepath);
         
-        // Write file
         if let Err(e) = fs::write(&filepath, &data) {
             eprintln!("Failed to save file: {:?}", e);
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1812,7 +1812,6 @@ async fn upload_image(
         
         println!("File saved successfully: {}", filepath);
         
-        // Return the URL path that matches the ServeDir route
         let url = format!("/uploads/{}", new_filename);
         
         println!("Returning URL: {}", url);
@@ -2014,6 +2013,7 @@ struct UpdateCouponRequest {
     active: bool,
     notes: Option<String>,
 }
+
 
 async fn get_coupons(
     State(state): State<Arc<AppState>>,
@@ -2277,6 +2277,590 @@ async fn bulk_delete_coupons(
             eprintln!("Failed to bulk delete: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
                 message: "Failed to delete coupons".into()
+            }))
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct WishlistItem {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    id: Option<ObjectId>,
+    #[serde(rename = "userId")]
+    user_id: String,
+    #[serde(rename = "productId")]
+    product_id: String,
+    #[serde(rename = "addedAt", skip_serializing_if = "Option::is_none")]
+    added_at: Option<String>,
+}
+
+async fn add_to_wishlist(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<WishlistItem>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let collection = state.db.collection::<Document>("wishlist");
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let Ok(Some(_)) = collection.find_one(doc! {
+        "userId": &payload.user_id,
+        "productId": &payload.product_id
+    }, None).await {
+        return (StatusCode::CONFLICT, Json(ApiResponse { message: "Already in wishlist".into() }));
+    }
+
+    let doc = doc! {
+        "userId": &payload.user_id,
+        "productId": &payload.product_id,
+        "addedAt": now
+    };
+
+    match collection.insert_one(doc, None).await {
+        Ok(_) => (StatusCode::CREATED, Json(ApiResponse { message: "Added to wishlist".into() })),
+        Err(e) => {
+            eprintln!("Wishlist insert error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { message: "Failed to add".into() }))
+        }
+    }
+}
+
+async fn get_wishlist(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<Vec<WishlistItem>>) {
+    let user_id = match params.get("userId") {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, Json(vec![])),
+    };
+
+    let collection = state.db.collection::<WishlistItem>("wishlist");
+    match collection.find(doc! { "userId": user_id }, None).await {
+        Ok(cursor) => {
+            let items: Vec<WishlistItem> = cursor.try_collect().await.unwrap_or_default();
+            (StatusCode::OK, Json(items))
+        }
+        Err(e) => {
+            eprintln!("Wishlist fetch error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+async fn remove_from_wishlist(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<WishlistItem>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let collection = state.db.collection::<Document>("wishlist");
+    match collection.delete_one(doc! {
+        "userId": &payload.user_id,
+        "productId": &payload.product_id
+    }, None).await {
+        Ok(res) => {
+            if res.deleted_count > 0 {
+                (StatusCode::OK, Json(ApiResponse { message: "Removed from wishlist".into() }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse { message: "Not found".into() }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Wishlist delete error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { message: "Failed to remove".into() }))
+        }
+    }
+}
+
+async fn get_product_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Option<Product>>) {
+    let collection = state.db.collection::<Product>("products");
+    
+    let object_id = match ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(None)),
+    };
+    
+    match collection.find_one(doc! { "_id": object_id }, None).await {
+        Ok(Some(product)) => (StatusCode::OK, Json(Some(product))),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
+        Err(e) => {
+            eprintln!("Error fetching product: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
+        }
+    }
+}
+
+async fn validate_coupon(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let code = match params.get("code") {
+        Some(c) => c.to_uppercase(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "message": "Coupon code required"
+        }))),
+    };
+    
+    let collection = state.db.collection::<Document>("coupons");
+    
+    match collection.find_one(doc! { "code": &code }, None).await {
+        Ok(Some(coupon_doc)) => {
+            let active = coupon_doc.get_bool("active").unwrap_or(false);
+            if !active {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "message": "Coupon is not active"
+                })));
+            }
+            
+            if let Ok(expiry) = coupon_doc.get_str("expiryDate") {
+                if let Ok(expiry_date) = chrono::DateTime::parse_from_rfc3339(expiry) {
+                    if expiry_date < chrono::Utc::now() {
+                        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                            "message": "Coupon has expired"
+                        })));
+                    }
+                }
+            }
+            
+            if let Some(max_uses) = coupon_doc.get_i32("maxUses").ok() {
+                let current_uses = coupon_doc.get_i32("currentUses").unwrap_or(0);
+                if current_uses >= max_uses {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "message": "Coupon usage limit reached"
+                    })));
+                }
+            }
+            
+            (StatusCode::OK, Json(serde_json::json!({
+                "code": code,
+                "type": coupon_doc.get_str("type").unwrap_or("fixed"),
+                "value": coupon_doc.get_f64("value").unwrap_or(0.0),
+                "minPurchase": coupon_doc.get_f64("minPurchase").ok(),
+            })))
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "message": "Invalid coupon code"
+        }))),
+        Err(e) => {
+            eprintln!("Database error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "message": "Server error"
+            })))
+        }
+    }
+}
+
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct OrderItem {
+    #[serde(rename = "productId")]
+    product_id: String,
+    name: String,
+    image: String,
+    price: f64,
+    quantity: i32,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct DeliveryInfo {
+    address: String,
+    city: String,
+    #[serde(rename = "postalCode", skip_serializing_if = "Option::is_none")]
+    postal_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct CouponInfo {
+    code: String,
+    #[serde(rename = "type")]
+    coupon_type: String,
+    value: f64,
+    #[serde(rename = "discountAmount")]
+    discount_amount: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct CreateOrderRequest {
+    #[serde(rename = "userId")]
+    user_id: String,
+    #[serde(rename = "userEmail")]
+    user_email: String,
+    username: String,
+    items: Vec<OrderItem>,
+    payment: String,
+    delivery: DeliveryInfo,
+    coupon: Option<CouponInfo>,
+    #[serde(rename = "calculatedSubtotal")]
+    calculated_subtotal: f64,
+    #[serde(rename = "calculatedTax")]
+    calculated_tax: f64,
+    #[serde(rename = "calculatedDeliveryFee")]
+    calculated_delivery_fee: f64,
+    #[serde(rename = "calculatedTotal")]
+    calculated_total: f64,
+}
+
+async fn create_order(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateOrderRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Creating order for user: {}", payload.user_email);
+    
+    if payload.items.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            message: "Order must contain at least one item".into()
+        }));
+    }
+    
+    let orders_collection = state.db.collection::<Document>("orders");
+    let products_collection = state.db.collection::<Document>("products");
+    
+    for item in &payload.items {
+        let product_result = products_collection
+            .find_one(doc! { "_id": mongodb::bson::oid::ObjectId::parse_str(&item.product_id).ok() }, None)
+            .await;
+        
+        match product_result {
+            Ok(Some(product)) => {
+                let current_stock = product.get_i32("inStock").unwrap_or(0);
+                if current_stock < item.quantity {
+                    return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                        message: format!("Insufficient stock for {}. Available: {}, Requested: {}", 
+                            item.name, current_stock, item.quantity)
+                    }));
+                }
+            }
+            Ok(None) => {
+                return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                    message: format!("Product {} not found", item.name)
+                }));
+            }
+            Err(e) => {
+                eprintln!("Error checking product stock: {:?}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                    message: "Failed to verify product availability".into()
+                }));
+            }
+        }
+    }
+    
+    let subtotal = payload.calculated_subtotal;
+    let tax = payload.calculated_tax;
+    let delivery_fee = payload.calculated_delivery_fee;
+    let total = payload.calculated_total;
+    
+    let timestamp = chrono::Utc::now().timestamp();
+    let order_number = format!("ORD{}", timestamp);
+    let now = chrono::Utc::now().to_rfc3339();
+    
+    let items_docs: Vec<Document> = payload.items.iter().map(|item| {
+        doc! {
+            "productId": &item.product_id,
+            "name": &item.name,
+            "image": &item.image,
+            "price": item.price,
+            "quantity": item.quantity,
+        }
+    }).collect();
+    
+    let mut order_doc = doc! {
+        "userId": &payload.user_id,
+        "userEmail": &payload.user_email,
+        "userName": &payload.username,
+        "items": items_docs,
+        "subtotal": subtotal,
+        "tax": tax,
+        "deliveryFee": delivery_fee,
+        "total": total,
+        "status": "processing",
+        "payment": &payload.payment,
+        "delivery": {
+            "address": &payload.delivery.address,
+            "city": &payload.delivery.city,
+            "postalCode": payload.delivery.postal_code,
+            "phone": payload.delivery.phone,
+        },
+        "createdAt": &now,
+        "orderNumber": &order_number,
+    };
+    
+    if let Some(coupon) = &payload.coupon {
+        order_doc.insert("coupon", doc! {
+            "code": &coupon.code,
+            "type": &coupon.coupon_type,
+            "value": coupon.value,
+            "discountAmount": coupon.discount_amount,
+        });
+    }
+    
+    match orders_collection.insert_one(order_doc, None).await {
+        Ok(_) => {
+            println!("Order created successfully: {}", order_number);
+            
+            for item in &payload.items {
+                if let Ok(product_id) = mongodb::bson::oid::ObjectId::parse_str(&item.product_id) {
+                    let update_result = products_collection.update_one(
+                        doc! { "_id": product_id },
+                        doc! { "$inc": { "inStock": -item.quantity } },
+                        None
+                    ).await;
+                    
+                    match update_result {
+                        Ok(_) => {
+                            println!("Updated stock for product {}: -{}", item.name, item.quantity);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to update stock for {}: {:?}", item.name, e);
+                        }
+                    }
+                }
+            }
+            
+            (StatusCode::CREATED, Json(ApiResponse {
+                message: format!("Order {} created successfully. Stock updated.", order_number)
+            }))
+        }
+        Err(e) => {
+            eprintln!("Failed to create order: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to create order".into()
+            }))
+        }
+    }
+}
+
+async fn get_orders(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> (StatusCode, Json<Vec<serde_json::Value>>) {
+    let user_email = match params.get("userEmail") {
+        Some(email) => email,
+        None => {
+            eprintln!("Missing userEmail parameter");
+            return (StatusCode::BAD_REQUEST, Json(vec![]));
+        }
+    };
+    
+    println!("Fetching orders for user: {}", user_email);
+    
+    let collection = state.db.collection::<Document>("orders");
+    
+    match collection.find(doc! { "userEmail": user_email }, None).await {
+        Ok(cursor) => {
+            let orders: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
+            
+            let result: Vec<serde_json::Value> = orders.iter().map(|order| {
+                let coupon_data = order.get_document("coupon").ok().map(|doc| {
+                    serde_json::json!({
+                        "code": doc.get_str("code").unwrap_or(""),
+                        "type": doc.get_str("type").unwrap_or(""),
+                        "value": doc.get_f64("value").unwrap_or(0.0),
+                        "discountAmount": doc.get_f64("discountAmount").unwrap_or(0.0)
+                    })
+                });
+                
+                serde_json::json!({
+                    "_id": order.get_object_id("_id").ok().map(|id| id.to_hex()),
+                    "orderNumber": order.get_str("orderNumber").unwrap_or("N/A"),
+                    "userId": order.get_str("userId").unwrap_or(""),
+                    "userEmail": order.get_str("userEmail").unwrap_or(""),
+                    "userName": order.get_str("userName").unwrap_or(""),
+                    "items": order.get_array("items").ok().map(|items| {
+                        items.iter().filter_map(|item| {
+                            item.as_document().map(|doc| {
+                                serde_json::json!({
+                                    "productId": doc.get_str("productId").unwrap_or(""),
+                                    "name": doc.get_str("name").unwrap_or(""),
+                                    "image": doc.get_str("image").unwrap_or(""),
+                                    "price": doc.get_f64("price").unwrap_or(0.0),
+                                    "quantity": doc.get_i32("quantity").unwrap_or(0)
+                                })
+                            })
+                        }).collect::<Vec<_>>()
+                    }).unwrap_or_default(),
+                    "subtotal": order.get_f64("subtotal").unwrap_or(0.0),
+                    "tax": order.get_f64("tax").unwrap_or(0.0),
+                    "deliveryFee": order.get_f64("deliveryFee").unwrap_or(0.0),
+                    "total": order.get_f64("total").unwrap_or(0.0),
+                    "status": order.get_str("status").unwrap_or("pending"),
+                    "payment": order.get_str("payment").unwrap_or(""),
+                    "delivery": order.get_document("delivery").ok().map(|doc| {
+                        serde_json::json!({
+                            "address": doc.get_str("address").unwrap_or(""),
+                            "city": doc.get_str("city").unwrap_or(""),
+                            "postalCode": doc.get_str("postalCode").ok(),
+                            "phone": doc.get_str("phone").ok()
+                        })
+                    }).unwrap_or(serde_json::json!({})),
+                    "coupon": coupon_data,
+                    "createdAt": order.get_str("createdAt").unwrap_or(""),
+                    "date": order.get_str("createdAt").unwrap_or("")
+                })
+            }).collect();
+            
+            println!("Found {} orders for user {}", result.len(), user_email);
+            (StatusCode::OK, Json(result))
+        }
+        Err(e) => {
+            eprintln!("Failed to fetch orders: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+
+async fn get_all_orders(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<Vec<serde_json::Value>>) {
+    println!("Fetching all orders for admin");
+    
+    let collection = state.db.collection::<Document>("orders");
+    
+    match collection.find(None, None).await {
+        Ok(cursor) => {
+            let orders: Vec<Document> = cursor.try_collect().await.unwrap_or_default();
+            
+            let result: Vec<serde_json::Value> = orders.iter().map(|order| {
+                serde_json::json!({
+                    "_id": order.get_object_id("_id").ok().map(|id| id.to_hex()),
+                    "orderNumber": order.get_str("orderNumber").unwrap_or("N/A"),
+                    "userId": order.get_str("userId").unwrap_or(""),
+                    "userEmail": order.get_str("userEmail").unwrap_or(""),
+                    "userName": order.get_str("userName").unwrap_or("Guest"),
+                    "items": order.get_array("items").ok().map(|items| {
+                        items.iter().filter_map(|item| {
+                            item.as_document().map(|doc| {
+                                serde_json::json!({
+                                    "productId": doc.get_str("productId").unwrap_or(""),
+                                    "name": doc.get_str("name").unwrap_or(""),
+                                    "image": doc.get_str("image").unwrap_or(""),
+                                    "price": doc.get_f64("price").unwrap_or(0.0),
+                                    "quantity": doc.get_i32("quantity").unwrap_or(0)
+                                })
+                            })
+                        }).collect::<Vec<_>>()
+                    }).unwrap_or_default(),
+                    "subtotal": order.get_f64("subtotal").unwrap_or(0.0),
+                    "tax": order.get_f64("tax").unwrap_or(0.0),
+                    "deliveryFee": order.get_f64("deliveryFee").unwrap_or(0.0),
+                    "total": order.get_f64("total").unwrap_or(0.0),
+                    "status": order.get_str("status").unwrap_or("pending"),
+                    "payment": order.get_str("payment").unwrap_or(""),
+                    "delivery": order.get_document("delivery").ok().map(|doc| {
+                        serde_json::json!({
+                            "address": doc.get_str("address").unwrap_or(""),
+                            "city": doc.get_str("city").unwrap_or(""),
+                            "postalCode": doc.get_str("postalCode").ok(),
+                            "phone": doc.get_str("phone").ok()
+                        })
+                    }).unwrap_or(serde_json::json!({})),
+                    "coupon": order.get_document("coupon").ok().map(|doc| {
+                        serde_json::json!({
+                            "code": doc.get_str("code").unwrap_or(""),
+                            "type": doc.get_str("type").unwrap_or(""),
+                            "value": doc.get_f64("value").unwrap_or(0.0),
+                            "discountAmount": doc.get_f64("discountAmount").unwrap_or(0.0)
+                        })
+                    }),
+                    "createdAt": order.get_str("createdAt").unwrap_or(""),
+                    "date": order.get_str("createdAt").unwrap_or("")
+                })
+            }).collect();
+            
+            println!("Found {} total orders", result.len());
+            (StatusCode::OK, Json(result))
+        }
+        Err(e) => {
+            eprintln!("Failed to fetch orders: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateStatusRequest {
+    status: String,
+}
+
+async fn update_order_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateStatusRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Updating order {} status to {}", id, payload.status);
+    
+    let collection = state.db.collection::<Document>("orders");
+    
+    let object_id = match mongodb::bson::oid::ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid order ID".into()
+            }));
+        }
+    };
+    
+    match collection.update_one(
+        doc! { "_id": object_id },
+        doc! { "$set": { "status": &payload.status } },
+        None
+    ).await {
+        Ok(result) => {
+            if result.matched_count > 0 {
+                println!("Order status updated successfully");
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Order status updated successfully".into()
+                }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Order not found".into()
+                }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to update order status: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to update order status".into()
+            }))
+        }
+    }
+}
+
+async fn delete_order(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<ApiResponse>) {
+    println!("Deleting order: {}", id);
+    
+    let collection = state.db.collection::<Document>("orders");
+    
+    let object_id = match mongodb::bson::oid::ObjectId::parse_str(&id) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                message: "Invalid order ID".into()
+            }));
+        }
+    };
+    
+    match collection.delete_one(doc! { "_id": object_id }, None).await {
+        Ok(result) => {
+            if result.deleted_count > 0 {
+                println!("Order deleted successfully");
+                (StatusCode::OK, Json(ApiResponse {
+                    message: "Order deleted successfully".into()
+                }))
+            } else {
+                (StatusCode::NOT_FOUND, Json(ApiResponse {
+                    message: "Order not found".into()
+                }))
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to delete order: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+                message: "Failed to delete order".into()
             }))
         }
     }
